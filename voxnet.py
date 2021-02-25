@@ -42,12 +42,13 @@ class VoxNet(nn.Module):
 
     def forward(self, x):
         x = self.feat(x)
+        #print(x.shape)
         x = x.view(x.size(0), -1)
         x = self.mlp(x)
         return x
 
 
 if __name__ == "__main__":
-    voxnet = VoxNet()
-    data = torch.rand([256, 1, 32, 32, 32])
-    voxnet(data)
+    voxnet = VoxNet(input_shape=(128,128,128))
+    data = torch.rand([256, 1, 128, 128, 128])
+    out = voxnet(data)

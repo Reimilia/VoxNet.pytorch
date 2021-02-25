@@ -24,9 +24,10 @@ from transformer import NaiveTransformer,FeatureTransformer,TokenizedTransformer
 from vit_3d_transformer import ViT3D,ViT3D_Efficient
 sys.path.insert(0, './data/')
 from modelnet10 import ModelNet10
-from modelnet40 import ModelNet40
-from shapenet_v2 import ShapeNetV2
+from modelnet40 import ModelNet40,ModelNet40_Constrastive
+from shapenet_v2 import ShapeNetV2,ShapeNetV2_Contrastive
 from linformer import Linformer
+from models.nt_xent_losses import NTXentLoss
 
 efficient_transformer = Linformer(
     dim = 32,
@@ -86,7 +87,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data-root', type=str, default='./data/ModelNet10', help="dataset path")
 parser.add_argument('--batchSize', type=int, default=64, help='input batch size')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--n-epoch', type=int, default=20, help='number of epochs to train for')
+parser.add_argument('--n-epoch', type=int, default=75, help='number of epochs to train for')
 parser.add_argument('--outf', type=str, default='./cls', help='output folder')
 parser.add_argument('--model', type=str, default='', help='model path')
 parser.add_argument('--dataset', type=str, default='ShapeNetV2', help='which dataset to be used')
@@ -94,7 +95,7 @@ parser.add_argument('--gpu', type=int, default=3, help='which GPU to use')
 opt = parser.parse_args()
 # print(opt)
 opt.dataset = 'ShapeNetV2'
-opt.outf='./cls/pure_transformer'
+opt.outf='./cls/contrastive_shapenet'
 
 downsample= True
 
@@ -132,24 +133,29 @@ elif opt.dataset == 'ShapeNetV2':
     train_size = int(0.8*len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = random_split(dataset, [train_size, test_size], generator=torch.Generator().manual_seed(9))
+    contrastive_dataset = ShapeNetV2_Contrastive(data_root=opt.data_root, n_classes=N_CLASSES, idx2cls=CLASSES)
+    contrastive_dataset, _ = random_split(contrastive_dataset, [train_size, test_size], generator=torch.Generator().manual_seed(9))
+    print(contrastive_dataset[0]['cls_idx'],train_dataset[0]['cls_idx'])
+    
 elif opt.dataset == 'ModelNet40':
     opt.data_root = '/mnt/storage/yiwang/data/ModelNet40_Aligned'
     CLASSES= CLASSES_ModelNet40
     N_CLASSES=len(CLASSES)
     train_dataset = ModelNet40(data_root=opt.data_root, n_classes=N_CLASSES, idx2cls=CLASSES, split='train')
     test_dataset = ModelNet40(data_root=opt.data_root, n_classes=N_CLASSES, idx2cls=CLASSES, split='test')
+    contrastive_dataset = ModelNet40_Constrastive(data_root=opt.data_root, n_classes=N_CLASSES, idx2cls=CLASSES, split='train')
 else:
     pass
 
 
-
+contrastive_dataloader = DataLoader(contrastive_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers))
 train_dataloader = DataLoader(train_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers))
 test_dataloader = DataLoader(test_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers))
 
 # VoxNet
-voxnet = VoxNet(n_classes=N_CLASSES)
+#voxnet = VoxNet(n_classes=N_CLASSES)
 #voxnet = TokenizedTransformer(n_classes=N_CLASSES)
-#voxnet = FeatureTransformer(n_classes=N_CLASSES, input_shape=(32, 32, 32))
+voxnet = FeatureTransformer(n_classes=N_CLASSES, input_shape=(32, 32, 32))
 #voxnet = FPNTransformer(n_classes=N_CLASSES)
 #voxnet = NaiveTransformer(n_classes=N_CLASSES, patch_size=4, feedforward_dim=512, mlp_dim=256, num_layers=4, nhead=4)
 #voxnet = ViT3D(voxel_size = 32, dim = 256, patch_size = 4, depth = 6, heads = 8, mlp_dim = 1024, num_classes=N_CLASSES, channels=1, dropout=0.3)
@@ -174,6 +180,101 @@ voxnet.to(device)
 
 num_batch = len(train_dataset) / opt.batchSize
 print(len(train_dataset))
+
+tau = 0.1
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for name, param in model.named_parameters():
+            if name=='mlp.fc2.weight' or name=='mlp.fc2.bias':
+                continue
+                #torch.nn.init.normal_(param)
+                #param.requires_grad = True
+            if name=='mlp.fc1.weight' or name=='mlp.fc1.bias':
+                continue
+                #torch.nn.init.normal_(param)
+                #param.requires_grad = True
+            param.requires_grad = False
+
+print("Start Contrastive learning!\n")
+
+for epoch in range(opt.n_epoch):
+    # scheduler.step()
+    for i, sample in tqdm(enumerate(contrastive_dataloader, 0)):
+        # 读数据
+        voxel, cls_idx = sample['voxel'], sample['cls_idx']
+        voxel, cls_idx = voxel.to(device), cls_idx.to(device)
+        voxel = voxel.float()  # Voxel原来是int类型(0,1),需转float, torch.Size([256, 1, 32, 32, 32])
+        voxel2 = sample['contrastive']
+
+        voxel2 = voxel2.to(device).float()
+        
+        if downsample:
+            voxel = torch.nn.functional.interpolate(voxel, size=(32,32,32), mode="trilinear")
+            voxel2 = torch.nn.functional.interpolate(voxel2, size=(32,32,32), mode="trilinear")
+
+        
+        # 梯度清零
+        optimizer.zero_grad()
+
+        # 网络切换训练模型
+        voxnet = voxnet.train()
+        pred = voxnet(voxel)  # torch.Size([256, 10])
+        pred2 = voxnet(voxel2)
+        # 计算损失函数
+
+        #cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+        #cosmat = cos(pred,pred2)
+        loss_func = NTXentLoss(device, len(cls_idx), tau, True)
+        loss = loss_func(pred, pred2)
+
+        # 反向传播, 更新权重
+        loss.backward()
+        optimizer.step()
+
+        # 计算该batch的预测准确率
+        pred_choice = pred.data.max(1)[1]
+        correct = pred_choice.eq(cls_idx.data).cpu().sum()
+        print('[%d: %d/%d] train loss: %f accuracy: %f' %
+              (epoch, i, num_batch, loss.item(), correct.item() / float(opt.batchSize)))
+        total_correct = 0
+        total_testset = 0
+
+
+        # 每5个batch进行一次test
+        # if i % 5 == 0:
+        #     j, sample = next(enumerate(test_dataloader, 0))
+        #     voxel, cls_idx = sample['voxel'], sample['cls_idx']
+        #     voxel, cls_idx = voxel.to(device), cls_idx.to(device)
+        #     voxel = voxel.float()  # 转float, torch.Size([256, 1, 32, 32, 32])
+        #     voxnet = voxnet.eval()
+        #     pred = voxnet(voxel)
+        #     loss = F.nll_loss(pred, cls_idx)
+        #     pred_choice = pred.data.max(1)[1]
+        #     correct = pred_choice.eq(cls_idx.data).cpu().sum()
+        #     print('[%d: %d/%d] %s loss: %f accuracy: %f' % (epoch, i, num_batch,
+        #                                                     blue('test'), loss.item(), correct.item()/float(opt.batchSize)))
+    for i, data in tqdm(enumerate(test_dataloader, 0)):
+        voxel, cls_idx = data['voxel'], data['cls_idx']
+        voxel, cls_idx = voxel.cuda(), cls_idx.cuda()
+        voxel = voxel.float()  # 转float, torch.Size([256, 1, 32, 32, 32])
+        if downsample:
+            voxel = torch.nn.functional.interpolate(voxel, size=(32,32,32), mode="trilinear")
+        voxnet = voxnet.eval()
+        pred = voxnet(voxel)
+        pred_choice = pred.data.max(1)[1]
+        correct = pred_choice.eq(cls_idx.data).cpu().sum()
+        total_correct += correct.item()
+        total_testset += voxel.size()[0]
+
+    print("Contrastive Learning: Epoch %d test accuracy %f" % (epoch, total_correct / float(total_testset)))
+    # 保存权重
+    # torch.save(voxnet.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
+
+
+print("Start Normal Classification Task Learning!\n")
+set_parameter_requires_grad(voxnet, True)
+
+
 
 for epoch in range(opt.n_epoch):
     # scheduler.step()
@@ -236,8 +337,7 @@ for epoch in range(opt.n_epoch):
 
     print("Epoch %d test accuracy %f" % (epoch, total_correct / float(total_testset)))
     # 保存权重
-    # torch.save(voxnet.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
-
+    torch.save(voxnet.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
 
 # 训练后, 在测试集上评估
 total_correct = 0

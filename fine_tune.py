@@ -27,6 +27,7 @@ from modelnet10 import ModelNet10
 from modelnet40 import ModelNet40
 from shapenet_v2 import ShapeNetV2
 from linformer import Linformer
+from collections import OrderedDict
 
 efficient_transformer = Linformer(
     dim = 32,
@@ -86,17 +87,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data-root', type=str, default='./data/ModelNet10', help="dataset path")
 parser.add_argument('--batchSize', type=int, default=64, help='input batch size')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--n-epoch', type=int, default=20, help='number of epochs to train for')
+parser.add_argument('--n-epoch', type=int, default=200, help='number of epochs to train for')
 parser.add_argument('--outf', type=str, default='./cls', help='output folder')
 parser.add_argument('--model', type=str, default='', help='model path')
 parser.add_argument('--dataset', type=str, default='ShapeNetV2', help='which dataset to be used')
-parser.add_argument('--gpu', type=int, default=3, help='which GPU to use')
+parser.add_argument('--gpu', type=int, default=1 , help='which GPU to use')
 opt = parser.parse_args()
 # print(opt)
-opt.dataset = 'ShapeNetV2'
-opt.outf='./cls/pure_transformer'
+opt.dataset = 'ModelNet10'
 
-downsample= True
+downsample= False
+opt.outf='./cls/fine_tune_256'
+opt.model ='./cls/cls_model_49.pth'
+
 
 if torch.cuda.is_available():
     device = torch.device("cuda:%d" % opt.gpu)
@@ -147,21 +150,35 @@ train_dataloader = DataLoader(train_dataset, batch_size=opt.batchSize, shuffle=T
 test_dataloader = DataLoader(test_dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers))
 
 # VoxNet
-voxnet = VoxNet(n_classes=N_CLASSES)
+#voxnet = VoxNet(n_classes=N_CLASSES)
 #voxnet = TokenizedTransformer(n_classes=N_CLASSES)
-#voxnet = FeatureTransformer(n_classes=N_CLASSES, input_shape=(32, 32, 32))
+voxnet = FeatureTransformer(n_classes=len(CLASSES_SHAPENET), input_shape=(32, 32, 32))
 #voxnet = FPNTransformer(n_classes=N_CLASSES)
-#voxnet = NaiveTransformer(n_classes=N_CLASSES, patch_size=4, feedforward_dim=512, mlp_dim=256, num_layers=4, nhead=4)
 #voxnet = ViT3D(voxel_size = 32, dim = 256, patch_size = 4, depth = 6, heads = 8, mlp_dim = 1024, num_classes=N_CLASSES, channels=1, dropout=0.3)
 #voxnet = ViT3D_Efficient(voxel_size = 32, dim = 32, patch_size = 1, num_classes = N_CLASSES, transformer=efficient_transformer, channels=1)
 
-print(voxnet)
+
+
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for name, param in model.named_parameters():
+            if name=='mlp.fc2.weight' or name=='mlp.fc2.bias':
+                continue
+            #if name=='mlp.fc1.weight' or name=='mlp.fc1.bias':
+            #    continue
+            param.requires_grad = False
+
+
+
 
 
 
 # 加载权重
 if opt.model != '':
     voxnet.load_state_dict(torch.load(opt.model))
+    voxnet.mlp[-1] = torch.nn.Linear(256, N_CLASSES)
+    set_parameter_requires_grad(voxnet, True)
+print(voxnet)
 
 # 优化器
 optimizer = optim.Adam(voxnet.parameters(), lr=1e-4)
@@ -236,7 +253,7 @@ for epoch in range(opt.n_epoch):
 
     print("Epoch %d test accuracy %f" % (epoch, total_correct / float(total_testset)))
     # 保存权重
-    # torch.save(voxnet.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
+    torch.save(voxnet.state_dict(), '%s/cls_model_%d.pth' % (opt.outf, epoch))
 
 
 # 训练后, 在测试集上评估
