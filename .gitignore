@@ -117,3 +117,4 @@ dmypy.json
 # ignore softlink `data/ModelNet10`
 data/ModelNet10
 cls/
+.vscode/
